@@ -1,0 +1,35 @@
+# cargo build --release --target=x86_64-unknown-linux-musl
+[package]
+name = "websocket_mq"
+version = "0.9.0"
+edition = "2021"
+authors = ["kiven <kivensoft@gmail.com>"]
+description = "Message queuing service base on websocket"
+repository = "https://github.com/kivensoft/websocket_mq"
+
+[profile.release]
+opt-level = 'z'  # Optimize for size
+lto = true
+strip = true
+codegen-units = 1
+incremental = false
+panic = 'abort'
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0" # 最流行的错误处理库
+log = "0.4" # 日志门面库，官方标准
+chrono = { version = "0.4" } # 最流行的日期时间库
+lazy_static = "1.4" # 最流行的静态变量声明库
+parking_lot = "0.12" # 性能更好的替代标准库Mutex/RwLock的三方库
+tokio = { version = "1.26", features = ["full"] } # 最流行的异步io库
+tokio-tungstenite = "0.18" # 基于tokio的异步websocket库，当下能找到的比较合适的
+redis = { version = "0.22", features = ["tokio-comp", "json"] }
+futures-util = "0.3"
+futures-channel = "0.3"
+serde = { version = "1.0", features = ["derive", "rc"] } # 最流行的序列化反序列化库
+serde_json = "1.0" # 最流行的json序列化反序列化库
+asynclog = { version = "1.0", path = "asynclog" } # 支持同步和异步两种方式的迷你日志实现库
+appconfig = { version = "1.0", path = "appconfig" } # 支持命令行参数解析和配置文件参数解析的库
+ansicolor = { version = "1.0", path = "ansicolor" } # 支持终端ansi颜色的库

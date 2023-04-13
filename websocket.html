@@ -1,0 +1,98 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>WebSocket Test</title>
+</head>
+
+<body>
+    <h2>WebSocket 测试工具</h2>
+
+    <div style="margin: 10px;">
+        <input id="url" type="text" value="127.0.0.1:8080/mq"/>
+        <button id="open" onclick="openWebSocket()">Open</button>
+        <button id="close" onclick="closeWebSocket()" disabled>Close</button>
+    </div>
+
+    <div style="margin: 10px;">
+        <button id="send" onclick="send()" disabled>Send</button>
+        <input id="text" type="text" value="hello"/>
+    </div>
+
+    <div id="message" style="margin: 10px;">
+    </div>
+</body>
+
+<script type="text/javascript">
+    var websocket = null;
+
+    //监听窗口关闭事件，当窗口关闭时，主动去关闭websocket连接，防止连接还没断开就关闭窗口，server端会抛异常。
+    window.onbeforeunload = function(){
+        websocket.close();
+    }
+
+    //将消息显示在网页上
+    function setMessageInnerHTML(innerHTML){
+        document.getElementById('message').innerHTML += '<div style="margin: 3px 0;"><span style="background-color: #f0f0f0;">'
+            + innerHTML + '</span></div>';
+    }
+
+    // 打开连接
+    function openWebSocket() {
+        //判断当前浏览器是否支持WebSocket
+        if('WebSocket' in window){
+            var url = "ws://" + document.getElementById("url").value
+            websocket = new WebSocket(url)
+            websocket.binaryType = "arraybuffer"
+
+            //连接发生错误的回调方法
+            websocket.onerror = function(){
+                setMessageInnerHTML("error");
+            };
+
+            //连接成功建立的回调方法
+            websocket.onopen = function(event){
+                setMessageInnerHTML("open");
+                document.getElementById("open").setAttribute("disabled", "");
+                document.getElementById("close").removeAttribute("disabled");
+                document.getElementById("send").removeAttribute("disabled");
+            }
+
+            //接收到消息的回调方法
+            websocket.onmessage = function(event){
+                console.log('event.data =', event.data)
+                setMessageInnerHTML("收到消息: " + event.data)
+            }
+
+            //连接关闭的回调方法
+            websocket.onclose = function(event){
+                setMessageInnerHTML("close, code = " + event.code + ", reason = " + event.reason);
+                document.getElementById("open").removeAttribute("disabled");
+                document.getElementById("close").setAttribute("disabled", "");
+                document.getElementById("send").setAttribute("disabled", "");
+            }
+        }
+        else{
+            alert('Not support websocket')
+        }
+    }
+
+    //关闭连接
+    function closeWebSocket() {
+        websocket.close();
+    }
+
+    //发送消息
+    function send() {
+        var message = document.getElementById('text').value
+        var jsonStr = JSON.stringify({type: 0, text: message})
+        try {
+            websocket.send(jsonStr)
+            setMessageInnerHTML('发送消息: ' + jsonStr)
+        } catch (e) {
+            setMessageInnerHTML('错误: ' + e)
+        }
+    }
+
+</script>
+</html>
