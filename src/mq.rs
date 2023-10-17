@@ -1,13 +1,22 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, SystemTime}};
+//! websocket
+
+use std::{net::SocketAddr, sync::Arc, time::{Duration, SystemTime}};
+
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
-use futures_util::{StreamExt, TryStreamExt, future};
+use dashmap::DashMap;
+use deadpool_redis::{Config, Runtime, redis, Pool};
+use futures_util::{StreamExt, SinkExt};
 use redis::{Client, AsyncCommands};
 use serde::{Serialize, Deserialize};
-use tokio::{net::{TcpListener, TcpStream}, time::{Instant, Interval}};
-use tokio_tungstenite::tungstenite::{protocol::Message};
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use futures_channel::mpsc::UnboundedSender;
+use serde_json::{Value, Map};
+use tokio::{net::{TcpListener, TcpStream}, time::Instant, sync::mpsc::UnboundedSender};
+use tokio_tungstenite::{
+    tungstenite::{{protocol::Message}, handshake::server::{Request, Response}},
+    accept_hdr_async, WebSocketStream,
+};
+use urlencoding::decode;
+
+use crate::AppConf;
 
 // 应用订阅消息 {前缀}:*
 // 应用发送鉴权请求 {前缀}:{AUTH_TOPIC}:{请求ID}
@@ -15,19 +24,13 @@ use futures_channel::mpsc::UnboundedSender;
 // 三方发送统计请求 {前缀}:{STAT_TOPIC}
 // 应用回复三方统计请求 {前缀}:{REPLY_TOPIC}:{STAT_TOPIC}
 
-const AUTH_TOPIC: &str = "authentication";          // 鉴权订阅子地址
-const STAT_TOPIC: &str = "statistics";              // 统计信息订阅子地址
-const REPLY_TOPIC: &str = "reply";                  // 统计信息订阅回复地址
-const LOGOUT_MSG: &str = r#"{"type":"logout"}"#;    // 鉴权失败后回复的消息
-const REDIS_RETRY_INTERVAL: u64 = 5;                // redis重新连接的间隔时间（单位：秒）
-const PING_INTERVAL: u64 = 10;                      // 发送ping的定时任务时间间隔（单位：秒）
-const PING_EXPIRE: u64 = 40;                        // 两次发送ping的最小时间间隔
-
+pub const AUTH_TOPIC: &str = "auth";                    // 鉴权订阅子地址
+pub const STAT_TOPIC: &str = "stat";                    // 统计信息订阅子地址
+pub const REPLY_TOPIC: &str = "reply";                  // 统计信息订阅回复地址
+pub const LOGOUT_MSG: &str = r#"{"type":"logout"}"#;    // 鉴权失败后回复的消息
+const REDIS_RETRY_INTERVAL: u64 = 5;                    // redis重新连接的间隔时间（单位：秒）
+const PING_INTERVAL: u64 = 10;                          // 发送ping的定时任务时间间隔（单位：秒）
 const CHAN_SEND_FAIL: &str = "channel send fail";
-
-type ClientMap = HashMap<u32, ClientData>;
-type SharedClients = Arc<Mutex<ClientMap>>;
-// type RedisConn = Arc<Mutex<Connection>>;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -39,192 +42,221 @@ pub struct ApiResult {
     pub data: Option<serde_json::Value>,
 }
 
+// websocket 客户端信息
 struct ClientData {
-    login:      bool,
-    last_time:  u64,
-    sender:     UnboundedSender<Message>,
+    login    : bool,
+    last_time: u64,
+    sender   : UnboundedSender<Message>,
+}
+
+// 全局调用参数
+struct WsClientParam {
+    redis_pre   : String,
+    redis_pool  : Pool,
+    redis_client: Client,
+    ws_clients  : DashMap<u32, ClientData>,
 }
 
 /// 启动websocket转发服务
-///
-/// 参数:
-///
-/// * `ws_addr` websocket监听地址:端口
-/// * `redis_addr` redis连接地址:端口
-/// * `redis_pass` redis连接的用户名:密码
-/// * `redis_pre` redis订阅主题前缀
-pub async fn start(ws_addr: &str, redis_addr: &str, redis_pass: &str, redis_pre: &str) -> Result<()> {
-    let socket_addr = ws_addr.parse::<SocketAddr>()?;
-    let listener = TcpListener::bind(socket_addr).await.expect(&format!("Failed to bind {ws_addr}"));
-    log::info!("启动websocket服务: {ws_addr}");
+pub async fn start() -> Result<()> {
+    let ac = AppConf::get();
+    let listener = {
+        let socket_addr = ac.listen.parse::<SocketAddr>()?;
+        TcpListener::bind(socket_addr).await
+            .with_context(|| format!("failed to bind {}", ac.listen))?
+    };
+    log::info!("startup websocket service: {}", ac.listen);
 
-    let ws_clients: SharedClients = Arc::new(Mutex::new(HashMap::new()));
+    let ws_client_param = {
+        let (pool, client) = init_pool(&ac.mq, &ac.mq_pass)?;
+        Arc::new(WsClientParam {
+            redis_pre: ac.mq_pre.clone(),
+            redis_pool: pool,
+            redis_client: client,
+            ws_clients: DashMap::new(),
+        })
+    };
 
     // 启动redis客户端连接，并进行订阅
-    let redis_url = format!("redis://{}@{}", redis_pass, redis_addr);
-    let redis_client = redis::Client::open(redis_url.as_str()).with_context(|| format!("连接redis失败: {redis_url}"))?;
-    log::info!("连接redis服务: {redis_url}");
-    create_redis_subcribe(redis_client.clone(), redis_pre, ws_clients.clone());
+    create_redis_subcribe(ws_client_param.clone());
 
     // 启动发送ping的定时任务
-    create_timer_ping(ws_clients.clone());
+    create_timer_ping(ws_client_param.clone(), ac.hb_time.parse().unwrap());
 
-    let (mut req_id, redis_pre) = (0, redis_pre.to_owned());
-    while let Ok((stream, addr)) = listener.accept().await {
+    let mut req_id = 0;
+    // 循环，处理tcp监听事件
+    while let Ok(stream_addr) = listener.accept().await {
         req_id += 1;
-        let (wscs, rc, pre) = (ws_clients.clone(), redis_client.clone(), redis_pre.clone());
+        let wcp = ws_client_param.clone();
         tokio::spawn(async move {
-            if let Err(e) = ws_on_conn(req_id, stream, addr, wscs, rc, pre).await {
-                log::error!("[WS:{req_id}] 客户端处理过程发生错误: {e}");
+            if let Err(e) = on_websocket(req_id, stream_addr, wcp).await {
+                log::error!("[WS:{req_id}] on_websocket error: {e:?}");
             }
         });
     }
 
-    log::debug!("结束websocket服务");
+    log::debug!("terminal websocket service");
     Ok(())
 }
 
 // websocket连接处理函数
-async fn ws_on_conn(id: u32, stream: TcpStream, addr: SocketAddr, clients: SharedClients, redis_client: Client, redis_pre: String) -> Result<()> {
-    log::debug!("[WS:{id}] 接受来自客户端{}的连接", addr);
+async fn on_websocket(id: u32, stream_addr: (TcpStream, SocketAddr),
+        wsc_param: Arc<WsClientParam>) -> Result<()> {
 
-    // 获取url中的参数，用于鉴权
-    let req_param = Arc::new(Mutex::new(String::new()));
-    let rq2 = req_param.clone();
-    let ws_stream = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, res: Response| {
-        if let Some(query) = req.uri().query() {
-            *rq2.lock() = query.to_owned();
-        }
-        log_request(req);
-        Ok(res)
-    }).await.expect("websocket握手失败");
-    log::debug!("[WS:{id}] WebSocket握手成功");
+    log::debug!("[WS:{id}] accept {} tcp connected", stream_addr.1);
 
-    let (ws_send, ws_recv) = ws_stream.split();
-    let (tx, rx) = futures_channel::mpsc::unbounded();
-    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    // 升级http协议到websocket，并获取url中query的参数
+    let (ws_stream, query) = websocket_accpet(stream_addr.0).await
+            .context("websocket handshake failed")?;
+    log::debug!("[WS:{id}] webSocket handshake successful");
+
+    let (mut ws_send, mut ws_recv) = ws_stream.split();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
     // 客户端加入集合，新建立的客户端登录状态为false
-    clients.lock().insert(id, ClientData{login: false, last_time: now, sender: tx});
-
-    // 发送鉴权校验请求消息
-    let auth_topic = format!("{redis_pre}:{AUTH_TOPIC}:{id}");
-    let mut publish_conn = redis_client.get_async_connection().await?;
-    let req_param = req_param.lock().clone();
-    publish_conn.publish(&auth_topic, &req_param).await?;
-
-    // 生成收到消息的处理流
-    let incoming = ws_recv.try_for_each(|msg| {
-        match msg {
-            Message::Text(msg) => {
-                log::debug!("[WS:{id}] 收到websocket文本消息: {msg}");
-            },
-            Message::Close(close_frame) => {
-                log::debug!("[WS:{id}] 收到websocket关闭连接消息: {close_frame:?}");
-                let client_data = clients.lock().remove(&id);
-                if let Some(client_data) = client_data {
-                    client_data.sender.unbounded_send(Message::Close(close_frame)).expect(CHAN_SEND_FAIL);
-                }
-            },
-            Message::Ping(v) => {
-                log::trace!("[WS:{id}] 收到ping包");
-                let clients = clients.lock();
-                let client_data = clients.get(&id);
-                if let Some(client_data) = client_data {
-                    client_data.sender.unbounded_send(Message::Pong(v)).expect(CHAN_SEND_FAIL);
-                }
-            },
-            Message::Pong(_) => {
-                log::trace!("[WS:{id}] 收到pong包");
-            },
-            _ => {},
-        }
-
-        future::ok(())
+    wsc_param.ws_clients.insert(id, ClientData{
+        login: false,
+        last_time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs(),
+        sender: tx,
     });
 
-    let receive = rx.map(Ok).forward(ws_send);
+    // 发送鉴权校验请求消息
+    let auth_topic = format!("{}:{}:{}", wsc_param.redis_pre, AUTH_TOPIC, id);
+    let auth_params = serde_json::to_string(&query)?;
+    wsc_param.redis_pool.get().await?
+            .publish(auth_topic, auth_params).await?;
 
-    futures_util::pin_mut!(incoming, receive);
-    future::select(incoming, receive).await;
+    loop {
+        tokio::select! {
+            // websocket 收到消息处理过程
+            msg = ws_recv.next() => match msg {
+                Some(msg) => match msg {
+                    Ok(msg) => match msg {
+                        Message::Text(msg) => {
+                            log::debug!("[WS:{id}] text message: {msg}");
+                        },
 
-    clients.lock().remove(&id);
-    log::debug!("[WS:{id}] 结束websocket处理");
+                        Message::Close(close_frame) => {
+                            log::debug!("[WS:{id}] close message: {close_frame:?}");
+                            break;
+                        },
+
+                        Message::Ping(v) => {
+                            log_ping_pong(id, "ping", &v);
+                            ws_send.send(Message::Pong(v)).await?;
+                        },
+
+                        Message::Pong(v) => {
+                            log_ping_pong(id, "pong", &v);
+                        },
+
+                        _ => log::trace!("[WS:{id}] unprocessed message type"),
+                    },
+                    Err(e) => {
+                        log::error!("[WS:{id}] receive message error: {e:?}");
+                        break;
+                    },
+                },
+                None => break,
+            },
+
+            // 通道收到消息，转发给websocket
+            msg = rx.recv() => match msg {
+                Some(msg @ Message::Close(_)) => {
+                    ws_send.send(msg).await?;
+                    break;
+                },
+                Some(msg) => ws_send.send(msg).await?,
+                None => break,
+            },
+        }
+    }
+
+    wsc_param.ws_clients.remove(&id);
+    log::debug!("[WS:{id}] terminate websocket client connect");
 
     Ok(())
 }
 
-// 记录请求头部的日志函数
-fn log_request(req: &Request) {
-    if log::log_enabled!(log::Level::Trace) {
-        log::trace!("接受新的websocket客户端连接");
-        log::trace!("请求路径: {}", req.uri().path());
-        log::trace!("请求头部内容如下:");
-        for (ref header, _value) in req.headers() {
-            log::trace!("* {}: {:?}", header, _value);
-        }
-        log::trace!("===============请求头结束");
-    }
-}
-
 // 进行redis订阅并进行处理
-async fn subscribe(redis_client: Client, redis_pre: String, ws_clients: SharedClients) -> Result<()> {
-    const SUB_FAIL: &str = "订阅消息失败";
+async fn on_redis_message(wsc_param: Arc<WsClientParam>) -> Result<()> {
 
-    let auth_reply_topic_prefix = format!("{}:{}:{}:", redis_pre, REPLY_TOPIC, AUTH_TOPIC);
+    let auth_reply_topic_prefix = format!("{}:{}:{}:", wsc_param.redis_pre, REPLY_TOPIC, AUTH_TOPIC);
     let auth_reply_topic = format!("{}*", auth_reply_topic_prefix);
-    let stat_topic = format!("{}:{}", redis_pre, STAT_TOPIC);
-    let stat_reply_topic = format!("{}:{}:{}", redis_pre, REPLY_TOPIC, STAT_TOPIC);
+    let stat_topic = format!("{}:{}", wsc_param.redis_pre, STAT_TOPIC);
+    let stat_reply_topic = format!("{}:{}:{}", wsc_param.redis_pre, REPLY_TOPIC, STAT_TOPIC);
 
-    let mut pubsub_conn = redis_client.get_async_connection().await.context("切换redis异步方式失败")?.into_pubsub();
-    pubsub_conn.subscribe(&redis_pre).await.context(SUB_FAIL)?;
-    pubsub_conn.subscribe(&stat_topic).await.context(SUB_FAIL)?;
-    pubsub_conn.psubscribe(&auth_reply_topic).await.context(SUB_FAIL)?;
-    log::info!("[redis] 订阅redis消息: {redis_pre}, {stat_topic}, {auth_reply_topic}");
+    // 订阅redis消息
+    let mut pubsub = wsc_param.redis_client
+            .get_async_connection().await
+            .context("get redis connect fail")?
+            .into_pubsub();
+    let subs = [&wsc_param.redis_pre, &stat_topic];
+    let psubs = [&auth_reply_topic];
+    pubsub.subscribe(&subs).await.context("redis subscribe fail")?;
+    pubsub.psubscribe(&psubs).await.context("redis psubscribe fail")?;
+    log::info!("redis subscribe: {subs:?}");
+    log::info!("redis psubscribe: {psubs:?}");
 
-    let mut pubsub_stream = pubsub_conn.on_message();
+    // 进入循环模式，监听并处理redis消息
+    let mut pubsub_stream = pubsub.into_on_message();
     loop {
-        let msg = pubsub_stream.next().await.context("获取订阅消息失败")?;
-        let addr = msg.get_channel_name();
-        let msg: String = msg.get_payload().context("获取订阅消息内容失败")?;
-        log::debug!("[redis] 收到{addr}的订阅消息: {msg}");
+        let msg = match pubsub_stream.next().await {
+            Some(msg) => msg,
+            None => continue,
+        };
+        let chan = msg.get_channel_name();
+        let payload = match std::str::from_utf8(msg.get_payload_bytes()) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("parse redis message to utf8 fail: {e:?}");
+                continue
+            },
+        };
+        log::debug!("redis receive on [{chan}]: {payload}");
 
-        // 鉴权回复消息
-        if addr.starts_with(&auth_reply_topic_prefix) {
-            let id = &addr[auth_reply_topic_prefix.len() ..];
-            let id = id.parse().context("解析鉴权响应消息的id失败")?;
-            let mut ws_clients = ws_clients.lock();
-            let client_data = ws_clients.get_mut(&id);
-            if let Some(client_data) = client_data {
-                let ar: ApiResult = serde_json::from_str(&msg)?;
+        // 鉴权回复消息，向websocket客户端回复登录结果
+        if chan.starts_with(&auth_reply_topic_prefix) {
+            // 解析消息地址中的id，该id关联实际的websocket客户端
+            let id = &chan[auth_reply_topic_prefix.len() ..];
+            let id = id.parse().context("parse auth message id fail")?;
+            let client_data = wsc_param.ws_clients.get_mut(&id);
+
+            if let Some(mut client_data) = client_data {
+                let cd = client_data.value_mut();
+                let ar: ApiResult = serde_json::from_str(payload)?;
+
                 if ar.code == 200 { // 鉴权成功
-                    client_data.login = true; // 修改登录状态
+                    cd.login = true; // 修改登录状态
+
                     if let Some(ar_data) = ar.data {
                         let ar_data = serde_json::to_string(&ar_data)?;
-                        client_data.sender.unbounded_send(Message::Text(ar_data))?;
+                        cd.sender.send(Message::Text(ar_data))?;
                     }
-                } else { // 鉴权失败
-                    client_data.sender.unbounded_send(Message::Text(LOGOUT_MSG.to_owned()))?;
-                    client_data.sender.unbounded_send(Message::Close(None))?;
+                } else { // 鉴权失败, 关闭客户端
+                    cd.sender.send(Message::Text(LOGOUT_MSG.to_owned()))?;
+                    cd.sender.send(Message::Close(None))?;
                 }
             }
         }
-        // 统计消息
-        else if addr == &stat_topic {
-            let total = ws_clients.lock().len();
-            let mut publish_conn = redis_client.get_async_connection().await?;
+        // 收到统计消息，向redis回复统计结果
+        else if chan == &stat_topic {
+            let total = wsc_param.ws_clients.len();
+            let mut conn = wsc_param.redis_pool.get().await?;
             let reply = serde_json::json!({
                 "clientTotal": total,
             });
             let reply = serde_json::to_string(&reply)?;
-            publish_conn.publish(&stat_reply_topic, &reply).await?;
+            conn.publish(&stat_reply_topic, &reply).await?;
         }
-        // 需要向客户端广播的消息
-        else if addr == &redis_pre {
+        // 需要向websocket客户端广播的消息
+        else if chan == &wsc_param.redis_pre {
             let mut total = 0;
-            let msg = Message::Text(msg);
-            for (_, v) in &*ws_clients.lock() {
-                if v.login {
-                    v.sender.unbounded_send(msg.clone()).context(CHAN_SEND_FAIL)?;
+            let msg = Message::Text(payload.to_owned());
+            for item in wsc_param.ws_clients.iter() {
+                let val = item.value();
+                if val.login {
+                    val.sender.send(msg.clone()).context(CHAN_SEND_FAIL)?;
                     total += 1;
                 }
             }
@@ -237,55 +269,140 @@ async fn subscribe(redis_client: Client, redis_pre: String, ws_clients: SharedCl
 }
 
 // 启动redis客户端连接，并进行订阅
-fn create_redis_subcribe(redis_client: Client, redis_pre: &str, ws_clients: SharedClients) {
-    let redis_pre = redis_pre.to_owned();
+fn create_redis_subcribe(wsc_param: Arc<WsClientParam>) {
     tokio::spawn(async move {
+        let interval = Duration::from_secs(REDIS_RETRY_INTERVAL);
         // 连接客户端并进行订阅，断线重连
-        while let Err(e) = subscribe(redis_client.clone(), redis_pre.clone(), ws_clients.clone()).await {
-            log::error!("{e}");
-            tokio::time::sleep(Duration::from_secs(REDIS_RETRY_INTERVAL)).await;
+        while let Err(e) = on_redis_message(wsc_param.clone()).await {
+            log::error!("redis on message error: {e:?}");
+            tokio::time::sleep(interval).await;
         }
     });
 }
 
 // 启动发送ping的定时任务
-fn create_timer_ping(ws_clients: SharedClients) {
-    let start = Instant::now() + Duration::from_secs(PING_INTERVAL);
-    let interval = Duration::from_secs(PING_INTERVAL);
-    let mut interval = tokio::time::interval_at(start, interval);
+fn create_timer_ping(wsc_param: Arc<WsClientParam>, ping_expire: u64) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = on_timer(&mut interval, &ws_clients).await {
+            if let Err(e) = on_timer(wsc_param.clone(), ping_expire).await {
                 log::error!("on_timer error: {e}");
             }
         }
     });
-
 }
 
 // 定时任务，向已连接的客户端发送ping包
-async fn on_timer(interval: &mut Interval, ws_clients: &SharedClients) -> Result<()> {
-    interval.tick().await;
-    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-    let mut ws_clients = ws_clients.lock();
+async fn on_timer(wsc_param: Arc<WsClientParam>, ping_expire: u64) -> Result<()> {
+    static INTERVAL: Duration = Duration::from_secs(PING_INTERVAL);
 
-    ws_clients.retain(|k, v| {
+    let start = Instant::now() + INTERVAL;
+    let mut delay = tokio::time::interval_at(start, INTERVAL);
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+
+    delay.tick().await;
+
+    wsc_param.ws_clients.retain(|k, v| {
+        // 已经登录或者未登录且过期，不删除
         if v.login || (!v.login && v.last_time + PING_INTERVAL >= now) {
             true
         } else {
-            log::debug!("删除过期登录不成功的客户端: {}", k);
-            v.sender.unbounded_send(Message::Close(None)).expect(CHAN_SEND_FAIL);
+            log::debug!("delete expired but not logged in clients: {}", k);
+            v.sender.send(Message::Close(None)).expect(CHAN_SEND_FAIL);
             false
         }
     });
 
-    for (k, v) in &mut *ws_clients {
-        if v.last_time + PING_EXPIRE <= now {
+    for mut entry in wsc_param.ws_clients.iter_mut() {
+        let v = entry.value_mut();
+        if v.last_time + ping_expire <= now {
             v.last_time = now;
-            v.sender.unbounded_send(Message::Ping(b"".to_vec())).context(CHAN_SEND_FAIL)?;
-            log::trace!("[ping] 向客户端{k}发送ping消息");
+            v.sender.send(Message::Ping(Vec::with_capacity(0)))?;
+            log::trace!("[ping:{}] sending ping messages to clients", entry.key());
         }
     }
 
     Ok(())
+}
+
+// websocket升级连接
+async fn websocket_accpet(stream: TcpStream) -> Result<(WebSocketStream<TcpStream>, Value)> {
+    let mut query = String::with_capacity(0);
+    let ws_stream = accept_hdr_async(stream, |req: &Request, res: Response| {
+        if let Some(q) = req.uri().query() {
+            query = q.to_owned();
+        }
+
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!("accept websocket client connect");
+            log::trace!("url: {}", req.uri());
+            log::trace!("header:");
+            for (ref header, _value) in req.headers() {
+                log::trace!("* {}: {:?}", header, _value);
+            }
+            log::trace!("===============请求头结束");
+        }
+
+        Ok(res)
+    }).await?;
+
+    let params = parse_url_query(&query).context("parse url query error")?;
+
+    Ok((ws_stream, params))
+}
+
+// 解析url中的参数
+fn parse_url_query(query: &str) -> Result<Value> {
+    if query.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    let mut params = Map::new();
+
+    for item in query.split('&') {
+        let mut s = item.splitn(2, '=');
+        let k = decode(s.next().unwrap_or(""))?;
+        let v = decode(s.next().unwrap_or(""))?;
+        if !k.is_empty() {
+            params.insert(String::from(k), Value::String(String::from(v)));
+        }
+    }
+
+    Ok(Value::Object(params))
+}
+
+// redis连接测试
+fn try_connect(url: &str) -> Result<Client> {
+    let client = redis::Client::open(url)?;
+    let mut conn = client.get_connection()?;
+    let val: String = redis::cmd("PING").arg(crate::APP_NAME).query(&mut conn)?;
+    if val != crate::APP_NAME {
+        anyhow::bail!(format!("ping redis error: {url}"));
+    }
+
+    Ok(client)
+}
+
+// 初始化redis连接池
+fn init_pool(host: &str, pass: &str) -> Result<(Pool, Client)> {
+    let redis_url = format!("redis://{}@{}", pass, host);
+
+    // 测试redis连接配置的正确性
+    let client = try_connect(&redis_url).context("test connect redis error")?;
+
+    let cfg = Config::from_url(redis_url.clone());
+    let pool = cfg.create_pool(Some(Runtime::Tokio1)).context("create redis pool fail")?;
+
+    log::info!("connect redis server: {}", redis_url);
+
+    Ok((pool, client))
+}
+
+fn log_ping_pong(id: u32, act: &str, text: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(&text) {
+        if text.is_empty() {
+            log::trace!("[WS:{id}] receive {act} message");
+        } else {
+            log::trace!("[WS:{id}] receive {act} message: {text}");
+        }
+    }
 }
